@@ -1,21 +1,20 @@
 import { useState, useMemo, useEffect, useRef } from "react";
+import { createContainer } from "unstated-next";
 import random from "lodash/random";
-import shuffle from "lodash/shuffle";
 import groupBy from "lodash/groupBy";
+import fromEntries from "lodash/fromPairs";
 import dateFormat from "date-fns/format";
 import startOfMinute from "date-fns/startOfMinute";
 import startOfHour from "date-fns/startOfHour";
 import startOfDay from "date-fns/startOfDay";
 import startOfWeek from "date-fns/startOfWeek";
-import differenceInSeconds from "date-fns/differenceInSeconds";
 import subMinutes from "date-fns/subMinutes";
 import getUnixTime from "date-fns/getUnixTime";
-import Big from "big.js";
 
 import { useDB } from "hooks/use-database";
-import { Position, useTrade } from "hooks/use-trade";
-
-type PriceSeries = [price: number, time: number][];
+import { useTrade } from "hooks/use-trade";
+import { getNewPriceFrom, RandomPrice } from "utils/price";
+import theme from "themes/default";
 
 enum Timeframe {
   M1 = "m1",
@@ -28,55 +27,84 @@ enum Timeframe {
   W4 = "w4",
 }
 
-enum DBKeys {
-  Name = "masa",
-  Series = "series",
+export enum MarketSentiment {
+  Bullish,
+  Bearish,
+  Neutral,
 }
 
-const useChart = () => {
-  const { db, isDbReady } = useDB();
+type OHLC = {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+
+type PriceSeries = [price: number, time: number][];
+
+const digit = 4;
+
+const useChartHook = () => {
+  const { seriesDBRef, isDbReady } = useDB();
   const { openPosition } = useTrade();
   const seriesRef = useRef<any>();
   const [isChartReady, setChartStatus] = useState(false);
   const [timeframe, setTimeframe] = useState<Timeframe>(Timeframe.M1);
   const [hasSynced, setSyncStatus] = useState(false);
   const [data, setData] = useState<PriceSeries>([]);
+  const lastPrice = useMemo(
+    () => [...data].reverse()?.[0]?.[0]?.toFixed(digit) ?? 0,
+    [data]
+  );
+  const secondLastPrice = useMemo(
+    () => [...data].reverse()?.[1]?.[0]?.toFixed(digit) ?? 0,
+    [data]
+  );
+  const isPriceUp = useMemo(() => lastPrice > secondLastPrice, [
+    lastPrice,
+    secondLastPrice,
+  ]);
+  const isPriceStuck = useMemo(() => lastPrice === secondLastPrice, [
+    lastPrice,
+    secondLastPrice,
+  ]);
 
   // Memoized Series
   // Get data series and take only last 100 data
   const series = useMemo(() => {
-    const timeframeGroup = groupBy(data, ([time]) => {
+    const timeframeGroup = groupBy(data, ([, timestamp]) => {
       switch (timeframe) {
         case Timeframe.M1:
-          return dateFormat(time, "dd-MM-yyyy HH:mm");
+          return dateFormat(timestamp, "dd-MM-yyyy HH:mm");
 
         case Timeframe.M5:
-          return `${dateFormat(time, "dd-MM-yyyy HH")} ${Math.floor(
-            Number(dateFormat(time, "m")) / 5
+          return `${dateFormat(timestamp, "dd-MM-yyyy HH")} ${Math.floor(
+            Number(dateFormat(timestamp, "m")) / 5
           )}`;
 
         case Timeframe.M30:
-          return `${dateFormat(time, "dd-MM-yyyy HH")} ${Math.floor(
-            Number(dateFormat(time, "m")) / 30
+          return `${dateFormat(timestamp, "dd-MM-yyyy HH")} ${Math.floor(
+            Number(dateFormat(timestamp, "m")) / 30
           )}`;
 
         case Timeframe.H1:
-          return dateFormat(time, "dd-MM-yyyy HH");
+          return dateFormat(timestamp, "dd-MM-yyyy HH");
 
         case Timeframe.H4:
-          return `${dateFormat(time, "dd-MM-yyyy HH")} ${Math.floor(
-            Number(dateFormat(time, "k")) / 4
+          return `${dateFormat(timestamp, "dd-MM-yyyy HH")} ${Math.floor(
+            Number(dateFormat(timestamp, "k")) / 4
           )}`;
 
         case Timeframe.D1:
-          return dateFormat(time, "dd-MM-yyyy");
+          return dateFormat(timestamp, "dd-MM-yyyy");
 
         case Timeframe.W1:
-          return dateFormat(time, "wo MM-yyyy");
+          return dateFormat(timestamp, "wo MM-yyyy");
 
         case Timeframe.W4:
-          return `${dateFormat(time, "MM-yyyy")} ${Math.floor(
-            Number(dateFormat(time, "w")) / 4
+          return `${dateFormat(timestamp, "MM-yyyy")} ${Math.floor(
+            Number(dateFormat(timestamp, "w")) / 4
           )}`;
       }
     });
@@ -116,13 +144,31 @@ const useChart = () => {
             break;
         }
 
-        return [date, open, high, low, close];
-      })
-      .splice(-100);
+        return { time: getUnixTime(date), open, high, low, close };
+      });
   }, [data, timeframe]);
 
+  const [ohlc, setOHLC] = useState<OHLC>();
+  const currentOHLC = useMemo(
+    () =>
+      fromEntries(
+        Object.entries(
+          ohlc ? ohlc : [...series].reverse()?.[0] ?? {}
+        ).map(([key, val]) => [key, key === "time" ? val : val.toFixed(digit)])
+      ),
+    [series, ohlc]
+  );
+
+  const sentiment = useMemo<MarketSentiment>(() => {
+    const [lastMarket] = [...series].reverse();
+    if (!lastMarket) return MarketSentiment.Neutral;
+    return lastMarket.close < lastMarket.open
+      ? MarketSentiment.Bearish
+      : MarketSentiment.Bullish;
+  }, [series]);
+
   // Generate data:
-  // - First sync-up data from indexed-db
+  // - First sync data with indexed-db
   // - Add tick simulator
   useEffect(() => {
     if (!process.browser) return;
@@ -130,32 +176,27 @@ const useChart = () => {
 
     let reqAnimFrame: number;
     let timeout;
-
-    function getNewPriceFrom(price: number) {
-      const randomPrice = random(1, 5, true);
-      const randomPosition = shuffle(
-        !openPosition
-          ? [1, 0]
-          : openPosition === Position.Buy
-          ? [0, 0, 0, 1]
-          : [1, 1, 1, 0]
-      );
-      const $price = new Big(price);
-      const [isUp] = randomPosition;
-      const newPrice = isUp
-        ? $price.plus(randomPrice).toNumber()
-        : $price.minus(randomPrice).toNumber();
-      return Math.sign(newPrice) < 0 ? 0 : newPrice;
-    }
+    const randomPricePosition = !openPosition
+      ? [1, 0]
+      : openPosition === "buy"
+      ? [0, 0, 1]
+      : [1, 1, 0];
+    const randomPrice: RandomPrice = !openPosition ? [1, 5] : [1, 2];
 
     async function init() {
       let frameReqCallback: FrameRequestCallback = async () => {
         const timestamp = Date.now();
-        const { price: lastPrice } = await db.current.toCollection().last();
+        const {
+          price: lastPrice,
+        } = await seriesDBRef.current.toCollection().last();
 
         timeout = setTimeout(() => {
-          const price = getNewPriceFrom(lastPrice);
-          db.current
+          const price = getNewPriceFrom(
+            lastPrice,
+            randomPricePosition,
+            randomPrice
+          );
+          seriesDBRef.current
             .add({
               price,
               timestamp,
@@ -164,16 +205,18 @@ const useChart = () => {
               const tsFrom =
                 getUnixTime(subMinutes(new Date(timestamp), 60)) * 1000;
               const tsTo = timestamp;
-              const data = await db.current
+              const data = await seriesDBRef.current
                 .where("[timestamp]")
                 .between([tsFrom], [tsTo])
+                .limit(20000)
                 .toArray();
 
-              setData(
-                data
-                  .slice(-500)
-                  .map(({ price, timestamp }) => [price, timestamp])
-              );
+              const series: PriceSeries = data.map(({ price, timestamp }) => [
+                price,
+                timestamp,
+              ]);
+              setData(series);
+              cancelAnimationFrame(reqAnimFrame);
               reqAnimFrame = requestAnimationFrame(frameReqCallback);
             });
         }, random(650, 1700, false));
@@ -184,92 +227,131 @@ const useChart = () => {
 
     // Sync data before initialization
     async function sync() {
-      let { price, timestamp } = await db.current.toCollection().last();
+      let {
+        price,
+        timestamp,
+      } = await seriesDBRef.current.toCollection().last();
 
       return new Promise((resolve) => {
         timeout = setTimeout(async () => {
           const now = Date.now();
-          const diffTicks = differenceInSeconds(
-            new Date(now),
-            new Date(timestamp)
-          );
-
           const bulkSeries = [];
-          for (let i = 0; i < diffTicks; i++) {
-            if (timestamp >= now) break;
+          while (timestamp <= now) {
             timestamp += random(500, 2000);
-            price = getNewPriceFrom(price);
+            price = getNewPriceFrom(price, randomPricePosition);
             bulkSeries.push({
               price,
               timestamp,
             });
           }
 
-          await db.current.bulkAdd(bulkSeries);
+          await seriesDBRef.current.bulkAdd(bulkSeries);
           resolve(true);
         }, 2500);
       });
     }
 
-    sync().then(async () => {
-      setSyncStatus(true);
-      await init();
-    });
+    if (hasSynced) {
+      init();
+    } else {
+      sync().then(async () => {
+        await init();
+        setSyncStatus(true);
+      });
+    }
 
     return () => {
       clearTimeout(timeout);
       cancelAnimationFrame(reqAnimFrame);
     };
-  }, [openPosition, isDbReady]);
+  }, [openPosition, hasSynced, isDbReady]);
 
   // Draw candlestick
   useEffect(() => {
     if (!process.browser) return;
-    if (isChartReady) {
-      if (!series.length) return;
-      if (!seriesRef.current) return;
+    if (!isDbReady) return;
+    if (!series.length) return;
 
-      if (series.length >= 100) {
-        const [latestData] = [...series];
-        seriesRef.current.addSeries(latestData);
-      } else {
-        seriesRef.current.addSeries(series);
-      }
+    if (isChartReady) {
+      if (!seriesRef.current) return;
+      seriesRef.current.setData(series);
       return;
     }
 
-    async function drawChart() {
-      const anychart = (window as Window &
-        typeof globalThis & {
-          anychart: {
-            onDocumentReady: (fn: Function) => void;
-            stock: () => any;
-            candlestick: () => any;
-            data: any;
-            plot: any;
-          };
-        }).anychart;
+    async function onCrossHairMove(param) {
+      if (!param.point) {
+        setOHLC(null);
+        return;
+      }
 
-      anychart.onDocumentReady(() => {
-        const chart = anychart.candlestick();
-        chart.container("candlestick");
-        chart.crosshair(true);
-        chart.draw();
-        seriesRef.current = chart;
-        setChartStatus(true);
-      });
+      const { seriesPrices } = param;
+      const ohlc: OHLC = seriesPrices.values().next().value;
+      if (ohlc?.open) setOHLC(ohlc);
     }
 
-    window.addEventListener("load", drawChart, false);
-    return () => {
-      window.removeEventListener("load", drawChart, false);
-    };
-  }, [isChartReady, series]);
+    async function drawChart() {
+      const candlestickElement = document.querySelector<HTMLElement>(
+        "#candlestick"
+      );
+      const chart = (window as any).LightweightCharts.createChart(
+        candlestickElement,
+        {
+          width: candlestickElement.clientWidth,
+          height: candlestickElement.clientHeight,
+          layout: {
+            backgroundColor: theme.colors.dark[500],
+            textColor: theme.colors.gray[400],
+            fontSize: 12,
+            fontFamily: "sans-serif",
+          },
+          priceScale: {
+            borderColor: theme.colors.dark[200],
+          },
+          timeScale: {
+            timeVisible: true,
+          },
+          crosshair: {
+            vertLine: {
+              color: theme.colors.dark[200],
+            },
+            horzLine: {
+              color: theme.colors.dark[200],
+            },
+          },
+          grid: {
+            vertLines: {
+              color: theme.colors.dark[100],
+            },
+            horzLines: {
+              color: theme.colors.dark[100],
+            },
+          },
+        }
+      );
+      chart.subscribeCrosshairMove(onCrossHairMove);
+      seriesRef.current = chart.addCandlestickSeries();
+      setChartStatus(true);
+    }
+
+    drawChart();
+  }, [isDbReady, isChartReady, series]);
 
   return {
-    series,
+    data,
+    isPriceUp,
+    isPriceStuck,
+    lastPrice,
+    secondLastPrice,
+    currentOHLC,
+    sentiment,
     hasSynced,
   };
 };
 
-export default useChart;
+const Container = createContainer(useChartHook);
+
+export const useChart = Container.useContainer;
+
+export const ChartProvider = Container.Provider;
+
+export default Container;
